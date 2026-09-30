@@ -1,0 +1,30 @@
+[package]
+name = "ipswitchd"
+version = "1.0.0"
+edition = "2021"
+description = "H5000M / MT5700M-CN 出口 IP 切换服务：按需切 APN 或重新拨号，对外提供 HTTP 触发端点"
+license = "MIT"
+
+# 依赖刻意压到最少：只需要一个异步运行时和一个 JSON 编解码。
+# HTTP 服务端由 tokio 手写（见 src/httpd.rs）—— 我们只支持两个 GET 路由，
+# 引入 hyper/axum 这类框架会凭空增加数 MB 体积与一长串传递依赖。
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "io-util",
+    "macros",
+    "process",
+] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+# ★ panic=abort 是刻意选择：让任何未预料的 panic 直接终止进程，
+#   由 procd 重新拉起，而不是留在一个已经不可信的状态里继续对外服务。
+panic = "abort"
+strip = true

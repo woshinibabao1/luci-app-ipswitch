@@ -1,0 +1,125 @@
+name: build
+
+# 两段式：
+#   check   —— 快（几十秒）：格式 + 全部测试（含端到端），跑在 ubuntu 上，不碰 SDK
+#   package —— 慢（十几分钟）：在 OpenWrt SDK 容器里交叉编译并打包
+#
+# check 故意不含任何交叉编译：它要在每次 push/PR 上给最快的反馈，
+# 而"能不能编译出 aarch64 的包"是另一回事（见 package）。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: 格式与测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src/rust/Cargo.lock') }}
+
+      - name: rustfmt 检查
+        run: cargo fmt --manifest-path src/rust/Cargo.toml --check
+
+      - name: 单元测试 + 端到端测试
+        run: cargo test --manifest-path src/rust/Cargo.toml
+
+      - name: 编译全部目标（含测试代码）
+        # `cargo test` 只编测试所需的目标；--all-targets 把其余也检查一遍，
+        # 避免"测试过了但主程序编不过"这种情况漏进来。
+        run: cargo check --manifest-path src/rust/Cargo.toml --all-targets
+
+      - name: shell 脚本语法检查
+        run: |
+          set -e
+          for f in root/etc/init.d/ipswitch root/etc/uci-defaults/50-ipswitch scripts/sdk-build.sh; do
+            echo "==> sh -n $f"
+            sh -n "$f"
+          done
+          # init.d / uci-defaults 必须有执行位（丢了会静默不自启）
+          for f in root/etc/init.d/ipswitch root/etc/uci-defaults/50-ipswitch; do
+            test -x "$f" || { echo "::error::$f 缺少执行位"; exit 1; }
+          done
+
+  package:
+    name: 交叉编译与打包
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # H5000M 是 ImmortalWrt SNAPSHOT / aarch64_cortex-a53 / mediatek-filogic。
+          # 两个 format 都出：设备用 apk，老固件用 ipk。
+          - image: aarch64_cortex-a53-main
+            arch: aarch64_cortex-a53
+            rust: aarch64-unknown-linux-musl
+            ver: main
+            target: mediatek/filogic
+            fmt: apk
+          - image: aarch64_cortex-a53-23.05.5
+            arch: aarch64_cortex-a53
+            rust: aarch64-unknown-linux-musl
+            ver: 23.05.5
+            target: mediatek/filogic
+            fmt: ipk
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 只读权限即可：不需要回推日志分支，产物走 artifact
+      - name: 在 OpenWrt SDK 容器内编译
+        run: |
+          mkdir -p out
+          set +e
+          docker run --rm --user root \
+            -v "$PWD:/work" \
+            -v "$PWD/out:/out" \
+            openwrt/sdk:${{ matrix.image }} \
+            /work/scripts/sdk-build.sh \
+              "${{ matrix.arch }}" "${{ matrix.rust }}" "${{ matrix.ver }}" "${{ matrix.target }}" \
+            2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "==> docker run 退出码: $rc"
+          exit $rc
+
+      - name: 校验产物存在
+        run: |
+          set -e
+          ls -la "out/${{ matrix.arch }}/"
+          if ! ls "out/${{ matrix.arch }}"/ipswitch_* >/dev/null 2>&1; then
+            echo "::error::没有产出 ipswitch 包"
+            exit 1
+          fi
+
+      - name: 保存构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.fmt }}-${{ matrix.arch }}
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: 上传包
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipswitch-${{ matrix.fmt }}-${{ matrix.arch }}
+          path: out/${{ matrix.arch }}/*
+          if-no-files-found: error

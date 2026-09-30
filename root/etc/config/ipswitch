@@ -1,0 +1,49 @@
+# 出口 IP 切换服务（ipswitchd）的配置。
+#
+# 改完执行 `/etc/init.d/ipswitch reload` 生效 —— 配置只在进程启动时读一次
+# （避免同一次切换中途配置变化，导致前后半段按不同参数执行）。
+
+config ipswitch 'config'
+	# HTTP 监听地址与端口。调用方（如 zgyd 的 -ip-switch）填
+	# http://<路由器地址>:8790/switch
+	# 监听 0.0.0.0 时安全性依赖 OpenWrt 默认的 WAN 侧 input 策略；
+	# 若你把防火墙改成了放行 WAN 入站，请自行加规则限制来源。
+	option listen '0.0.0.0'
+	option port '8790'
+
+	# 写进响应流、供调用方判定"切换完成"的标记文本。
+	# 必须与调用方 -ip-switch-marker 的取值一致（zgyd 的默认值就是这个）。
+	option marker 'IP切换完成'
+
+	# 切换策略：
+	#   redial —— 只重新拨号，不动 APN（默认，最安全）
+	#   apn    —— 在 apn_list 里轮换下一个 APN 后重新拨号
+	option method 'redial'
+
+	# APN 池，逗号分隔，method='apn' 时按顺序轮换。
+	# ★ 必须填真实可用的 APN（移动 cmnet / 联通 3gnet / 电信 ctnet 之类）。
+	#   填错会导致模组因空 APN 或错误 APN 被网络拒绝、进入退避窗口 —— 直接断网。
+	#   留空 = 不做 APN 轮换。
+	option apn_list ''
+
+	# APN 协议类型，写进 AT^SETAUTODIAL 第 3 个参数：IP / IPV6 / IPV4V6
+	option apn_protocol 'IP'
+
+	# 拨号方式，写进 AT^SETAUTODIAL 第 2 个参数（手册 16.18）：
+	#   0 = 模组内部拨号
+	#   1 = 上位机拨号（USB 作为数传接口）—— H5000M 的默认形态
+	#   2 = 上位机拨号（网口作为数传接口）
+	option dial_mode '1'
+
+	# 单次切换的最长等待秒数。
+	# ★ 必须小于调用方的等待上限：zgyd 的 -ip-switch-timeout 默认 60s，
+	#   这里默认 45s 留出余量。两边都调大时记得同步。
+	option timeout '45'
+
+	# WAN 接口名（用来判断"是否已经拿到地址"）。
+	# H5000M 上是 MT5700M（设备 eth2）。
+	option wan_iface 'MT5700M'
+
+	# MT5700 Console 后端 RPC 地址。后端默认只监听回环，不要改成外网地址。
+	option rpc_host '127.0.0.1'
+	option rpc_port '8765'
