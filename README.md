@@ -145,6 +145,9 @@ zgyd 默认等 60s，本服务默认 45s（留 15s 余量给网络往返）。
 
 ## 4. HTTP 接口
 
+> 本节是概览。**完整接口契约（含状态码、响应头、字段表、上游 RPC 协议、错误响应）
+> 见 [`docs/api.md`](docs/api.md)。**
+
 ### `GET /switch` —— 换一次 IP
 
 响应 `HTTP/1.1 200`，`Content-Type: text/plain; charset=utf-8`，
