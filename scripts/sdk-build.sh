@@ -142,12 +142,32 @@ chmod 0755 package/ipswitch/root/etc/uci-defaults/50-ipswitch
 rm -rf package/ipswitch/src/rust/target
 
 # ---------- 5) 选中并编译 ----------
-# SDK 的 defconfig 不会自动选中"刚复制进来"的包；未选中时
-# `make package/<pkg>/compile` 只打印 "Nothing to be done" 并返回 0 ——
-# 那会产出一个"成功但没有包"的假绿，所以这里必须显式选中。
-grep -q '^CONFIG_PACKAGE_ipswitch=' .config 2>/dev/null ||
-	echo 'CONFIG_PACKAGE_ipswitch=y' >>.config
+# ★ 必须显式选中包，而且**选完要回读断言**。
+#
+# SDK 的 defconfig 不会自动选中"刚复制进 package/"的包；包未被选中时，
+# `make package/<pkg>/compile` 只会跑一遍清理、什么都不编、**返回 0**
+# —— 也就是产出一个"成功但没有包"的假绿。
+#
+# 下面这套流程照搬 MT5700 Console 里已经跑通的写法，四个细节都不是多余的：
+#   ① `touch .config`  —— SDK 解压后不保证存在 .config；
+#      缺了它 grep 与 kconfig 的行为都会变。
+#   ② 先 `grep -v` 删掉同名旧行再追加 —— 同一个 symbol 在 .config 里
+#      出现两次时 kconfig 取哪一行并不直观。
+#   ③ `=m` 而不是 `=y` —— SDK 只负责编包；`=y` 是"装进固件"的语义。
+#   ④ defconfig 之后**断言真的被选中** —— 这是唯一能挡住假绿的地方。
+touch .config
+grep -v '^CONFIG_PACKAGE_ipswitch=' .config > .config.new || true
+mv .config.new .config
+echo 'CONFIG_PACKAGE_ipswitch=m' >>.config
 make defconfig >/dev/null
+
+echo "==> .config 里的 ipswitch 相关项（诊断用）："
+grep -E 'CONFIG_PACKAGE_ipswitch' .config || echo "    (一条都没有)"
+
+grep -qE '^CONFIG_PACKAGE_ipswitch=[my]$' .config || {
+	echo "ERROR: ipswitch 未被 .config 选中 —— 继续编译只会得到空包"
+	exit 1
+}
 
 export RUST_TRIPLE
 echo "==> 编译 ipswitch（target=$RUST_TRIPLE）"

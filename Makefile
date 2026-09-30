@@ -19,7 +19,11 @@ PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=woshinibabao1 <ajmd007@qq.com>
 
 # 源码随包提供（src/ 下的 Rust 工程在构建期交叉编译），不走下载。
-PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+# ★ 刻意**不**手写 PKG_BUILD_DIR：package.mk 的默认值才是权威
+#   （`$(BUILD_DIR)/target-$(BOARD)_$(ARCH)/…`）。自己用 $(BUILD_DIR) 拼一个
+#   会漏掉 target 那一层，而 package.mk 用的是 `?=`，谁生效取决于定义顺序
+#   —— 这种"两个地方各说一套"的坑不值得留。本文件与 src/Makefile
+#   一律只引用 $(PKG_BUILD_DIR) 变量本身，值由 package.mk 定。
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -44,7 +48,6 @@ export RUST_TRIPLE
 define Package/ipswitch
   SECTION:=net
   CATEGORY:=Network
-  SUBMENU:=WWAN
   TITLE:=出口 IP 切换服务（切 APN / 重新拨号）
   URL:=https://github.com/woshinibabao1/luci-app-ipswitch
   # 不写 DEPENDS: 本服务的硬前提是「设备上存在 MT5700 Console 后端」，
