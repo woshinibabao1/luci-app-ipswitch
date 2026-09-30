@@ -61,7 +61,7 @@ zgyd ──GET /switch──▶ ipswitchd ──newline-JSON/TCP──▶ at-web
 ### 方式一：用预编译包（推荐）
 
 从本仓库的 GitHub Actions 产物里取对应你固件包管理器的那个文件。
-最近一次成功构建出的产物（每个约 362 KB）：
+最近一次成功构建出的产物（每个约 362 KiB）：
 
 | 固件 | 包格式 | CI artifact 名 | 实际文件名 |
 |---|---|---|---|
@@ -335,9 +335,18 @@ cargo fmt
 CI（`.github/workflows/build.yml`）两段，**已实跑验证通过**：
 
 1. `check`：`rustfmt --check` + `cargo test` + `cargo check --all-targets` + shell 语法/执行位检查
-   —— 约 40 秒
+   —— 实测 50 秒（热缓存）
 2. `package`：`needs: check`，用 `openwrt/sdk` 容器矩阵交叉编译 aarch64-musl，出 `.apk` 与 `.ipk`
-   —— 约 5 分钟（两条并行）
+   —— 两条并行，实测 ipk 2 分 51 秒、apk 4 分 26 秒
+
+产物（实测，第 36705305094 次运行）：
+
+| CI artifact 名 | 大小 |
+|---|---|
+| `ipswitch-apk-aarch64_cortex-a53` | 370,349 字节 |
+| `ipswitch-ipk-aarch64_cortex-a53` | 371,674 字节 |
+
+另有两个 `build-log-*` 附件，编译失败时先下它。
 
 交叉编译这块踩过三个"静默失败"，全部记在 `docs/adr/0005`：
 顶层 Makefile 里禁止 `$(error)`、SDK 选中包之后必须回读断言、
