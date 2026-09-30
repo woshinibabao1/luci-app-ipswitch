@@ -155,6 +155,12 @@ rm -rf package/ipswitch/src/rust/target
 #      出现两次时 kconfig 取哪一行并不直观。
 #   ③ `=m` 而不是 `=y` —— SDK 只负责编包；`=y` 是"装进固件"的语义。
 #   ④ defconfig 之后**断言真的被选中** —— 这是唯一能挡住假绿的地方。
+#
+# ★ RUST_TRIPLE 在这里是**权威来源**：顶层 Makefile 只做 ARCH→triple 的
+#   兜底推断，显式传入的值优先（`RUST_TRIPLE ?=`）。放在 defconfig 之前
+#   export，保证元数据扫描 `make -C package/ipswitch DUMP=1` 也看得到它。
+export RUST_TRIPLE
+
 touch .config
 grep -v '^CONFIG_PACKAGE_ipswitch=' .config > .config.new || true
 mv .config.new .config
@@ -169,7 +175,6 @@ grep -qE '^CONFIG_PACKAGE_ipswitch=[my]$' .config || {
 	exit 1
 }
 
-export RUST_TRIPLE
 echo "==> 编译 ipswitch（target=$RUST_TRIPLE）"
 make package/ipswitch/compile V=s
 

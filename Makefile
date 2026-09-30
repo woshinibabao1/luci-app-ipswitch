@@ -28,21 +28,58 @@ PKG_MAINTAINER:=woshinibabao1 <ajmd007@qq.com>
 include $(INCLUDE_DIR)/package.mk
 
 # ---- OpenWrt ARCH → Rust musl target 映射 ----
-# 注意大小端：mips*_24kc 是 big-endian（mips），mipsel* 是 little-endian。
-# 这里的映射由 src/Makefile 直接使用（经 RUST_TRIPLE 环境变量传入），
-# 以免同一张表在两个文件里各写一份、改一处忘一处。
-RUST_TRIPLE_aarch64     := aarch64-unknown-linux-musl
-RUST_TRIPLE_x86_64      := x86_64-unknown-linux-musl
-RUST_TRIPLE_mipsel      := mipsel-unknown-linux-musl
-RUST_TRIPLE_mips        := mips-unknown-linux-musl
-RUST_TRIPLE_mips_24kc   := mips-unknown-linux-musl
-RUST_TRIPLE_mipsel_24kc := mipsel-unknown-linux-musl
-RUST_TRIPLE_arm         := armv7-unknown-linux-musleabihf
+#
+# ★★★ 这一段**绝对不能出现 `$(error)`**，这是个极难定位的坑：
+#
+#   OpenWrt 生成 `tmp/.config-package.in` 时，会对**每个包**跑一次
+#   `make -C package/<name> DUMP=1` 来收集元数据。那次解析一旦失败，
+#   包就**不会进 metadata**，后果是：
+#     · 包在 menuconfig 里凭空消失
+#     · 往 .config 写 CONFIG_PACKAGE_xxx 会被 defconfig 当成**未知符号丢掉**
+#       （连 `# ... is not set` 都不留）
+#     · `make package/<name>/compile` 变成空目标，清理一下就**返回 0**
+#   —— 而**一句错误消息都看不到**（子 make 的 stderr 没有透出来）。
+#
+#   所以：解析期一律给安全值，真正的报错推迟到 Build/Compile。
+#
+# 大小端注意：mips*_24kc 是 big-endian（mips），mipsel* 是 little-endian。
+# OpenWrt 的 ARCH 是 `<cpu>_<variant>` 形态（如 aarch64_cortex-a53），
+# 穷举不可能穷尽 —— 所以下面既有精确表，也有按 CPU 家族的前缀兜底。
+RUST_TRIPLE_aarch64_cortex-a53 := aarch64-unknown-linux-musl
+RUST_TRIPLE_aarch64_cortex-a55 := aarch64-unknown-linux-musl
+RUST_TRIPLE_aarch64_generic    := aarch64-unknown-linux-musl
+RUST_TRIPLE_x86_64             := x86_64-unknown-linux-musl
+RUST_TRIPLE_mipsel_24kc        := mipsel-unknown-linux-musl
+RUST_TRIPLE_mips_24kc          := mips-unknown-linux-musl
+RUST_TRIPLE_arm_cortex-a7      := armv7-unknown-linux-musleabihf
+RUST_TRIPLE_arm_cortex-a9      := armv7-unknown-linux-musleabihf
 
-RUST_TRIPLE:=$(RUST_TRIPLE_$(ARCH))
+# 优先级：外部显式传入 > 精确表 > 前缀推断。
+# 外部传入是 scripts/sdk-build.sh 的做法（`export RUST_TRIPLE=...`），最权威。
+#
+# ★ 这里用 `ifeq ($(strip ...),)` 而不是 `?=`：make 的 `?=` 在变量"已定义但为空"
+#   时不赋值，于是环境里一个空的 RUST_TRIPLE 就能把整条兜底链短路掉。
+#   判空则不受此影响。
 ifeq ($(strip $(RUST_TRIPLE)),)
-$(error 本包尚不支持架构 $(ARCH)：请在顶层 Makefile 的 RUST_TRIPLE_* 表里补一行)
+  RUST_TRIPLE := $(RUST_TRIPLE_$(ARCH))
 endif
+
+ifeq ($(strip $(RUST_TRIPLE)),)
+  # 前缀兜底。★ 顺序要紧：`mipsel%` 必须排在 `mips%` 之前，
+  # 否则 mipsel_24kc 会被 mips% 抢走、编出大端二进制。
+  ifneq ($(filter aarch64%,$(ARCH)),)
+    RUST_TRIPLE := aarch64-unknown-linux-musl
+  else ifneq ($(filter mipsel%,$(ARCH)),)
+    RUST_TRIPLE := mipsel-unknown-linux-musl
+  else ifneq ($(filter mips%,$(ARCH)),)
+    RUST_TRIPLE := mips-unknown-linux-musl
+  else ifneq ($(filter arm%,$(ARCH)),)
+    RUST_TRIPLE := armv7-unknown-linux-musleabihf
+  else ifneq ($(filter x86_64%,$(ARCH)),)
+    RUST_TRIPLE := x86_64-unknown-linux-musl
+  endif
+endif
+
 export RUST_TRIPLE
 
 define Package/ipswitch
@@ -80,6 +117,11 @@ define Build/Prepare
 endef
 
 define Build/Compile
+	@[ -n "$(RUST_TRIPLE)" ] || { \
+		echo "ERROR: 架构 $(ARCH) 推不出对应的 Rust musl target。"; \
+		echo "       请在顶层 Makefile 的 RUST_TRIPLE_* 表 / 前缀兜底里补上，"; \
+		echo "       或用 RUST_TRIPLE=<triple> 显式指定。"; \
+		exit 1; }
 	$(MAKE) -C $(PKG_BUILD_DIR)/src \
 		ARCH="$(ARCH)" \
 		RUST_TRIPLE="$(RUST_TRIPLE)" \
