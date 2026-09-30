@@ -60,22 +60,29 @@ zgyd ──GET /switch──▶ ipswitchd ──newline-JSON/TCP──▶ at-web
 
 ### 方式一：用预编译包（推荐）
 
-从本仓库的 GitHub Actions 产物里取对应你固件包管理器的那个文件：
+从本仓库的 GitHub Actions 产物里取对应你固件包管理器的那个文件。
+最近一次成功构建出的产物（每个约 362 KB）：
 
-| 固件 | 包格式 | 产物名 |
-|---|---|---|
-| ImmortalWrt / OpenWrt **SNAPSHOT**（apk） | `.apk` | `ipswitch-*.apk` |
-| OpenWrt **23.05 / 24.10**（opkg） | `.ipk` | `ipswitch_*.ipk` |
+| 固件 | 包格式 | CI artifact 名 | 实际文件名 |
+|---|---|---|---|
+| ImmortalWrt / OpenWrt **SNAPSHOT**（apk） | `.apk` | `ipswitch-apk-aarch64_cortex-a53` | `ipswitch-1.0.0-r1.apk` |
+| OpenWrt **23.05 / 24.10**（opkg） | `.ipk` | `ipswitch-ipk-aarch64_cortex-a53` | `ipswitch_1.0.0-1_aarch64_cortex-a53.ipk` |
 
 ```sh
 #apk
-apk add --allow-untrusted ./ipswitch-*.apk
+apk add --allow-untrusted ./ipswitch-1.0.0-r1.apk
 
 #opkg
-opkg install ./ipswitch_*.ipk
+opkg install ./ipswitch_1.0.0-1_aarch64_cortex-a53.ipk
 ```
 
 装完 `uci-defaults` 会自动 `chmod +x`、`enable` 并 `start`。
+
+**升级不会丢配置**：`/etc/config/ipswitch` 在包定义里声明为 `conffiles`
+（apk 侧是 `protected_paths`），所以升级时你填过的 APN 池、marker、超时都会保留。
+反过来说，**新版本新增的配置项不会自动出现在你的旧配置文件里** ——
+这没关系，程序对缺项一律用默认值兜底（`Config::from_uci`），
+需要时 `uci set` 补上即可。
 
 ### 方式二：从源码编译
 
@@ -325,10 +332,18 @@ cargo fmt
 - `/status` 只读、未知路由 404、`/health` 存活
 - `method=apn` 的 APN 轮换
 
-CI（`.github/workflows/build.yml`）两段：
+CI（`.github/workflows/build.yml`）两段，**已实跑验证通过**：
 
 1. `check`：`rustfmt --check` + `cargo test` + `cargo check --all-targets` + shell 语法/执行位检查
+   —— 约 40 秒
 2. `package`：`needs: check`，用 `openwrt/sdk` 容器矩阵交叉编译 aarch64-musl，出 `.apk` 与 `.ipk`
+   —— 约 5 分钟（两条并行）
+
+交叉编译这块踩过三个"静默失败"，全部记在 `docs/adr/0005`：
+顶层 Makefile 里禁止 `$(error)`、SDK 选中包之后必须回读断言、
+apk 与 ipk 的产物名分隔符不同（连字符 vs 下划线）。
+**改构建脚本前请先读那一条 ADR** —— 这三个坑的共同点是
+`make` 全返回 0 或给出与真因无关的报错。
 
 ---
 
@@ -338,6 +353,7 @@ CI（`.github/workflows/build.yml`）两段：
 - **端口固定 8790**：与 MT5700 Console 的 8765 错开，避免混淆
 - **`dial_mode` 默认 1**：针对 H5000M 的 USB-CDC-NCM 形态；换设备要核对
 - **不做外网 IP 校验**：见第 5 节，这是刻意的取舍，代价是「DHCP 给了同一个地址」这种情况会被判为成功（`saw_link_down` 提示可作辅助判据）
-- **Rust 二进制随包交叉编译**：本机没有工具链，**任何 Rust 改动都必须在 CI 或 SDK 里验证**
+- **Rust 二进制随包交叉编译**：本机没有工具链，**任何 Rust 改动都必须在 CI 或 SDK 里验证**（CI 已跑通，直接 push 即可）
+- **`conffiles` 只保护 `/etc/config/ipswitch`**：`/etc/init.d/ipswitch` 与二进制属于包本体，升级时会被正常替换
 
 架构决策的详细论证见 `docs/adr/`。

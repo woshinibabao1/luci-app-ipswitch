@@ -13,6 +13,7 @@
 | [0002](0002-device-side-state-as-completion-criterion.md) | 以模组侧状态判定「切换完成」 | 接口地址会残留，不能单独作判据 |
 | [0003](0003-redial-writes-back-current-apn.md) | 重拨前把当前 APN 原样写回 | 省略形态会让模组清空 APN → 断网 |
 | [0004](0004-marker-only-on-success.md) | 标记文本只在成功时输出 | 调用方把「看到标记」当作成功的唯一依据 |
+| [0005](0005-build-time-hard-constraints.md) | OpenWrt 构建期的三条硬约束 | 顶层禁 `$(error)`／选中包要回读断言／apk 与 ipk 产物名分隔符不同 |
 
 新增决策时：编号递增，**不要修改已定案 ADR 的结论**——若要推翻，新开一条并在其中
 说明「取代 000X」。
