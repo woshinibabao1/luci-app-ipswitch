@@ -179,9 +179,14 @@ echo "==> 编译 ipswitch（target=$RUST_TRIPLE）"
 make package/ipswitch/compile V=s
 
 # ---------- 6) 收集产物 ----------
+# ★ 两种包格式的产物名**分隔符不一样**，pattern 必须都覆盖：
+#     ipk: ipswitch_1.0.0-1_aarch64_cortex-a53.ipk   ← 包名与版本之间用下划线
+#     apk: ipswitch-1.0.0-r1.apk                    ← 用连字符
+#   只写 `ipswitch_*.apk` 会漏掉 apk —— main(SNAPSHOT) 那条 job 就是这么
+#   在"包其实已经编出来"的情况下报"没产出包"的。
 mkdir -p /out/"$ARCH"
 FOUND=0
-for f in $(find bin -type f \( -name 'ipswitch_*.apk' -o -name 'ipswitch_*.ipk' \) 2>/dev/null); do
+for f in $(find bin -type f \( -name 'ipswitch[-_]*.apk' -o -name 'ipswitch[-_]*.ipk' \) 2>/dev/null); do
 	cp -v "$f" /out/"$ARCH"/
 	FOUND=1
 done
@@ -192,7 +197,7 @@ if [ "$FOUND" -ne 1 ]; then
 fi
 
 # 顺带确认二进制真的进了包（体积闸门：Rust 静态二进制应在数百 KB 量级）
-for p in /out/"$ARCH"/ipswitch_*; do
+for p in /out/"$ARCH"/ipswitch*; do
 	echo "==> 产物: $p ($(wc -c <"$p") bytes)"
 done
 echo "==> 完成"

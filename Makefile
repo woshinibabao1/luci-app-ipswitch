@@ -94,6 +94,15 @@ define Package/ipswitch
   # 切换时若 AT 通道不可用也会给出可读的报错。
 endef
 
+# ★ 必须声明 conffiles：`/etc/config/ipswitch` 是**用户会改**的文件
+#   （APN 池、marker、超时都要按设备实际情况填）。
+#   不声明的话，升级包时用户改过的配置会被新包里的默认值直接覆盖 ——
+#   而且不会有任何提示。对 ipk 是 opkg 的 conffiles 语义，
+#   对 apk 则转成 protected_paths。
+define Package/ipswitch/conffiles
+/etc/config/ipswitch
+endef
+
 define Package/ipswitch/description
   按需切换 5G 模组的出口 IP：可以换 APN，也可以只重新拨号。
 

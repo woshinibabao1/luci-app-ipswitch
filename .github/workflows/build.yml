@@ -104,7 +104,9 @@ jobs:
         run: |
           set -e
           ls -la "out/${{ matrix.arch }}/"
-          if ! ls "out/${{ matrix.arch }}"/ipswitch_* >/dev/null 2>&1; then
+          # 用 ipswitch* 而不是 ipswitch_*：apk 的产物名是 ipswitch-1.0.0-r1.apk
+          # （连字符），ipk 才是 ipswitch_1.0.0-1_<arch>.ipk
+          if ! ls "out/${{ matrix.arch }}"/ipswitch* >/dev/null 2>&1; then
             echo "::error::没有产出 ipswitch 包"
             exit 1
           fi
