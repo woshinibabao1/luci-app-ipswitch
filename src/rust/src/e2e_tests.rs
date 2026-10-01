@@ -305,6 +305,11 @@ async fn switch_survives_client_disconnect_and_finishes_the_job() {
     );
 }
 
+/// 并发请求：一个执行、另一个**明确被拒**（不排队、不重复切换）。
+///
+/// 旧行为是第二个请求排队等锁，然后**自己再跑一遍完整的断开+拨号** ——
+/// 调用方只想换一次 IP，却换来两次；更糟的是它会吃掉调用方的重试预算
+/// （调用方超时后重试过来，排在还在跑的那次后面）。见 `switch_ip` 的注释。
 #[tokio::test]
 async fn concurrent_switches_are_serialized_not_interleaved() {
     let (rpc, _) = spawn_automaton_rpc(true).await;
@@ -314,14 +319,27 @@ async fn concurrent_switches_are_serialized_not_interleaved() {
     let b = http_get(addr, "/switch");
     let (ra, rb) = tokio::join!(a, b);
 
-    assert!(ra.contains("IP切换完成") && rb.contains("IP切换完成"));
+    // 一个成功、一个被明确拒绝；谁先谁后不保证，按内容判断。
+    let (ok_body, rejected) = if ra.contains("IP切换完成") {
+        (&ra, &rb)
+    } else {
+        (&rb, &ra)
+    };
+    assert!(
+        ok_body.contains("IP切换完成"),
+        "应有且只有一次切换成功: {ra} / {rb}"
+    );
+    assert!(
+        rejected.contains("已有一次切换正在进行中"),
+        "并发的第二个请求应被明确拒绝（而不是排队并再切一次）: {rejected}"
+    );
+    assert!(
+        !rejected.contains("IP切换完成"),
+        "被拒绝的请求绝不能吐出成功标记 —— 那会让调用方以为它换好了: {rejected}"
+    );
 
-    // 两次切换必须各自完整：断开、拨号各 2 次，且不能交错
+    // 关键不变式：**只发生了一次**切换（断开/拨号各一次），没有交错、也没有第二次。
     let cmds = rpc.commands();
-    let downs = cmds.iter().filter(|c| *c == "AT^SETAUTODIAL=0").count();
-    assert_eq!(downs, 2, "两次请求应各断开一次: {cmds:?}");
-
-    // 交替检查：把命令压成 D(断)/U(连) 序列，必须是 D..U..D..U 而不是 D D U U
     let seq: Vec<char> = cmds
         .iter()
         .filter_map(|c| {
@@ -336,8 +354,8 @@ async fn concurrent_switches_are_serialized_not_interleaved() {
         .collect();
     assert_eq!(
         seq,
-        vec!['D', 'U', 'D', 'U'],
-        "★ 两次切换交错会让模组卡在中间态: {seq:?}"
+        vec!['D', 'U'],
+        "★ 并发请求只应触发一次断开+一次拨号，且不得交错: {seq:?}"
     );
 }
 
