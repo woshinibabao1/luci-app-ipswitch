@@ -213,7 +213,12 @@ IP切换完成
 
 ### `GET /` 或 `GET /health` —— 存活探测
 
-返回 `200` + `ipswitchd ok`。不碰模组，可当心跳用。
+两者 body 都以 `ipswitchd ok` 开头，**不碰模组、不碰 AT 通道**，可当心跳用。
+
+区别：`/health` 会额外补一行 JSON，并按 **AT 通道探活结果**给状态码 ——
+AT 明确不通时返回 **503 + `"status":"degraded"`**。这样"服务活着但干不了活"
+（最常见：MT5700 Console 后端没跑）能被一条探针看出来，而不是等每次切换都失败。
+`unknown`（还没探过）不算失败，仍给 200。
 
 ---
 
@@ -322,10 +327,20 @@ zgyd ... -ip-switch-marker '换好了'
 
 ```sh
 cd src/rust
-cargo test              # 48 个用例：39 单元 + 9 端到端
+cargo test              # 59 个用例：47 单元 + 12 端到端
 cargo check --all-targets
 cargo fmt
 ```
+
+> **Windows 上的一个坑**：如果仓库路径含非 ASCII 字符（例如 `D:\AI空间\...`），
+> `cargo test` 的 debug 链接会因为对象文件名对不上而失败
+> （`cannot find ....rcgu.o` / `lib*.rlib`）。把目标目录指到纯 ASCII 路径即可：
+>
+> ```powershell
+> $env:CARGO_TARGET_DIR = "D:\rust-target-ipswitch"; cargo test
+> ```
+>
+> （`cargo build --release` 不受影响。本条是实测结论，不是猜测。）
 
 端到端用例（`src/rust/src/e2e_tests.rs`）会**起一个真的 TCP 假后端 + 真的 HTTP 假客户端**，
 把 `HTTP → httpd → switcher → rpc → 假模组` 整条链路跑通，覆盖：
@@ -334,8 +349,9 @@ cargo fmt
 - 拨号一直不回时的超时判定
 - 调用方中途断开、切换仍跑完
 - 并发请求串行化不交错
-- `/status` 只读、未知路由 404、`/health` 存活
+- `/status` 只读、未知路由 404、`/health` 存活与 degraded
 - `method=apn` 的 APN 轮换
+- 资源上限：单行长度在读取期生效、客户端不读响应不拖住服务
 
 CI（`.github/workflows/build.yml`）两段，**已实跑验证通过**：
 

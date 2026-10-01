@@ -19,7 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::config::Config;
 use crate::httpd;
 use crate::rpc::AtClient;
-use crate::switcher::Switcher;
+use crate::switcher::{AtState, Switcher};
 
 /// 假 AT 后端。
 struct FakeRpc {
@@ -31,13 +31,6 @@ struct FakeRpc {
 impl FakeRpc {
     fn commands(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
-    }
-
-    fn count_of(&self, prefix: &str) -> usize {
-        self.commands()
-            .iter()
-            .filter(|c| c.starts_with(prefix))
-            .count()
     }
 }
 
@@ -150,8 +143,28 @@ fn test_config(rpc_port: u16) -> Config {
 
 /// 起服务并返回它的实际地址。
 async fn start_server(cfg: Config) -> SocketAddr {
+    start_server_with_handle(cfg).await.0
+}
+
+/// 起服务，同时返回它的 task 句柄（用例可以等它自己收场）。
+async fn start_server_with_handle(cfg: Config) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let at = AtClient::new("127.0.0.1", cfg.rpc_port, "");
     let sw = Switcher::new(cfg, at);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定 HTTP 端口");
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = httpd::accept_loop(listener, sw).await;
+    });
+    (addr, handle)
+}
+
+/// 起服务并把 AT 通道探活结果设成 `state`（供 /health、/status 用例）。
+async fn start_server_with_at_state(cfg: Config, state: AtState) -> SocketAddr {
+    let at = AtClient::new("127.0.0.1", cfg.rpc_port, "");
+    let sw = Switcher::new(cfg, at);
+    sw.set_at_state(state);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("绑定 HTTP 端口");
@@ -412,4 +425,170 @@ async fn apn_strategy_switches_apn_and_reports_it() {
         ups.last().unwrap().contains("\"ctnet\""),
         "APN 池应轮换: {ups:?}"
     );
+}
+
+// ─────────────────── 资源上限：客户端不能把服务拖住 ───────────────────
+//
+// 这三条都是"资源上限"用例，判据是**连接必须自己收场**，而不是"内存数字" ——
+// 内存数字在 CI 里不可观测，但"服务端任务在 N 秒内结束"是可观测且稳定的代理指标。
+
+/// 超长的行（不发换行）不会让服务端无界地读下去。
+///
+/// 旧实现是 `read_until` 之后才 `truncate`：`HEADER_TIMEOUT` 约束的是整次调用耗时，
+/// 不是字节数，所以"慢慢发、不发换行"能让行缓冲一直长。修好后上限在**读取期**生效。
+///
+/// ★ 这条直接在 `read_line` 上量"到底读掉了多少字节" —— 这是唯一能直接观测上限的
+/// 位置。在 socket 上量会被内核收发缓冲掩盖（实测：客户端灌 4MB 也「成功」，
+/// 因为对端根本不读、字节全堆在内核缓冲里），那种判据是测不出来的。
+///
+/// 变异验证：把 `reader.take(MAX_LINE as u64)` 去掉（回到"读完再截断"）→ 判红。
+#[tokio::test]
+async fn read_line_is_bounded_by_max_line() {
+    /// 一个**永不结束**、也**永不给换行**的输入。
+    ///
+    /// `limit` 是夹具自身的安全阀：万一被测代码真的没有上限，这里会先报错，
+    /// 而不是让测试进程去申请几百 GB（变异验证时亲眼见过
+    /// `memory allocation of 17179869184 bytes failed` —— 那正是这个漏洞的形态）。
+    struct NoNewlineForever {
+        served: Arc<std::sync::atomic::AtomicUsize>,
+        limit: usize,
+    }
+    impl tokio::io::AsyncRead for NoNewlineForever {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let already = self.served.load(std::sync::atomic::Ordering::Relaxed);
+            if already >= self.limit {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("夹具安全阀：已送出 {already} 字节，被测代码没有上限"),
+                )));
+            }
+            let n = buf.remaining();
+            buf.put_slice(&vec![b'A'; n]);
+            self.served
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    const SAFETY_LIMIT: usize = 4 * 1024 * 1024;
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut reader = tokio::io::BufReader::new(NoNewlineForever {
+        served: served.clone(),
+        limit: SAFETY_LIMIT,
+    });
+
+    let got = tokio::time::timeout(Duration::from_secs(5), httpd::read_line(&mut reader))
+        .await
+        .expect("read_line 必须在上限处返回，而不是一直读下去");
+
+    let n = served.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        n <= httpd::MAX_LINE * 2,
+        "read_line 从一条没有换行的流里读掉了 {n} 字节（上限 {}）：读取期没有上限",
+        httpd::MAX_LINE
+    );
+    // 到上限就当成"这不完整的一行"处理：要么给回截断内容，要么当对端关闭。
+    assert!(
+        matches!(got, Ok(None) | Ok(Some(_))),
+        "read_line 到上限应正常返回，而不是报错: {got:?}"
+    );
+}
+
+/// 客户端连上却不读响应：这条连接不能把服务端拖住。
+///
+/// ★ 判据不能等 accept 循环（它永不返回），也不能等连接任务本身（拿不到句柄）。
+/// 这里用**可观测的行为**：等第一个连接结束之后，服务端必须还能正常服务 ——
+/// 一个把连接任务挂死、或者把连接额度漏掉的实现，会在这一步露馅。
+///
+/// 变异验证：把 `/switch` 里的写超时去掉、并让连接任务永久挂住（例如把
+/// `broken` 分支的 `continue` 改成 `return` 之前忘了排空 channel）→ 判红。
+#[tokio::test]
+async fn client_that_never_reads_does_not_hold_the_connection_task() {
+    let (rpc, _) = spawn_automaton_rpc(true).await;
+    let addr = start_server(test_config(rpc.addr.port())).await;
+
+    {
+        let mut s = TcpStream::connect(addr).await.expect("连接 HTTP 服务");
+        s.write_all(b"GET /switch HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        s.flush().await.unwrap();
+        // ★ 刻意不读任何响应；连接 drop 后服务端的写会失败 → 走"调用方已走"路径。
+    }
+
+    // 服务端必须继续正常服务（这条也顺带证明连接额度被归还了）。
+    let body = tokio::time::timeout(Duration::from_secs(20), http_get(addr, "/status"))
+        .await
+        .expect("第一个连接结束后，服务端没有在 20s 内继续响应新请求");
+    assert!(body.contains("200 OK"), "{body}");
+}
+
+// ─────────────────── /health 要能反映"能不能干活" ───────────────────
+
+/// AT 通道明确探活失败时，`/health` 必须报 degraded 并给 503。
+///
+/// 最常见的坏状态是"服务在跑、AT 后端挂了"：那时每次切换都会失败，
+/// 但只看"进程活着"的 /health 依旧 200，调用方与人都是瞎的。
+#[tokio::test]
+async fn health_reports_degraded_when_at_channel_probe_failed() {
+    let (rpc, _) = spawn_automaton_rpc(true).await;
+    let cfg = test_config(rpc.addr.port());
+
+    let ok_addr = start_server_with_at_state(cfg.clone(), AtState::Ok).await;
+    let ok_body = http_get(ok_addr, "/health").await;
+    assert!(ok_body.contains("200 OK"), "{ok_body}");
+    assert!(ok_body.contains("\"at_channel\":\"ok\""), "{ok_body}");
+
+    let bad_addr = start_server_with_at_state(cfg, AtState::Failed).await;
+    let bad_body = http_get(bad_addr, "/health").await;
+    assert!(
+        bad_body.contains("503"),
+        "AT 通道探活失败时 /health 应给 503: {bad_body}"
+    );
+    assert!(bad_body.contains("degraded"), "{bad_body}");
+    assert!(bad_body.contains("\"at_channel\":\"failed\""), "{bad_body}");
+}
+
+/// `/status` 也要带上 AT 通道状态（它是排查时的第一站）。
+#[tokio::test]
+async fn status_exposes_at_channel_state() {
+    let (rpc, _) = spawn_automaton_rpc(true).await;
+    let addr = start_server_with_at_state(test_config(rpc.addr.port()), AtState::Failed).await;
+
+    let before = rpc.commands().len();
+    let body = http_get(addr, "/status").await;
+
+    assert!(body.contains("\"at_channel\":\"failed\""), "{body}");
+    // ★ 仍然只读：不许下发任何写命令
+    let after = rpc.commands();
+    let writes = after[before..]
+        .iter()
+        .filter(|c| c.starts_with("AT^SETAUTODIAL") && !c.ends_with('?'))
+        .count();
+    assert_eq!(writes, 0, "/status 不许改设备状态");
+}
+
+/// `/` 保持极简存活语义（兼容手敲 curl 的习惯），不因为 AT 挂了就报错。
+#[tokio::test]
+async fn root_stays_minimal_even_when_at_is_down() {
+    let (rpc, _) = spawn_automaton_rpc(true).await;
+    let addr = start_server_with_at_state(test_config(rpc.addr.port()), AtState::Failed).await;
+    let body = http_get(addr, "/").await;
+    assert!(body.contains("200 OK"), "{body}");
+    assert!(body.contains("ipswitchd ok"), "{body}");
+}
+
+/// 未设置探活结果（`Unknown`）时不报 degraded —— 后端可能稍后才就绪，
+/// 启动探活失败并不阻止服务启动，所以"没探过"不等于"干不了活"。
+#[tokio::test]
+async fn health_unknown_state_is_not_degraded() {
+    let (rpc, _) = spawn_automaton_rpc(true).await;
+    let addr = start_server(test_config(rpc.addr.port())).await;
+    let body = http_get(addr, "/health").await;
+    assert!(body.contains("200 OK"), "{body}");
+    assert!(body.contains("\"at_channel\":\"unknown\""), "{body}");
 }

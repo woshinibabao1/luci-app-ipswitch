@@ -19,7 +19,7 @@
 //! ```
 
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,48 @@ use tokio::sync::{mpsc, Mutex};
 use crate::config::{Config, Method};
 use crate::netif;
 use crate::rpc::{AtClient, AtReply};
+
+/// AT 通道可达性：`Unknown` = 还没探过。
+///
+/// ★ 为什么需要它：`/health` 只说 "ipswitchd ok" 时，**进程活着**与
+/// **能真的换 IP** 是两回事。最常见的坏状态恰恰是"服务在跑、但 AT 后端挂了" ——
+/// 那时候 `/health` 依旧 200，调用方却每次切换都失败。把这个状态暴露出去，
+/// 让"服务活着但干不了活"可被一条探针看出来。
+///
+/// 用 `AtomicU8` 而不是 `Mutex<bool>`：它是一个只在启动时写一次的三态，
+/// 而读它的 `/health` 要能被高频调用、不该有任何阻塞。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtState {
+    Unknown,
+    Ok,
+    Failed,
+}
+
+impl AtState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => AtState::Ok,
+            2 => AtState::Failed,
+            _ => AtState::Unknown,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            AtState::Unknown => 0,
+            AtState::Ok => 1,
+            AtState::Failed => 2,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AtState::Unknown => "unknown",
+            AtState::Ok => "ok",
+            AtState::Failed => "failed",
+        }
+    }
+}
 
 /// 轮询间隔。700ms 是"足够快"与"别把 AT 通道占满"之间的折中
 /// —— MT5700 Console 的硬性要求是稳态 AT 请求 ≤ 2 次/秒。
@@ -102,6 +144,8 @@ pub struct Switcher {
     apn_cursor: AtomicUsize,
     /// 最近一次切换结果，供 `/status` 查阅。
     last: Mutex<Option<SwitchReport>>,
+    /// AT 通道可达性（启动探活结果），供 `/health` 与 `/status` 查阅。
+    at_state: AtomicU8,
 }
 
 impl Switcher {
@@ -112,11 +156,22 @@ impl Switcher {
             lock: Mutex::new(()),
             apn_cursor: AtomicUsize::new(0),
             last: Mutex::new(None),
+            at_state: AtomicU8::new(AtState::Unknown.as_u8()),
         })
     }
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// 记录一次 AT 通道探活结果（启动时调用一次）。
+    pub fn set_at_state(&self, st: AtState) {
+        self.at_state.store(st.as_u8(), Ordering::Relaxed);
+    }
+
+    /// 读取 AT 通道探活结果。
+    pub fn at_state(&self) -> AtState {
+        AtState::from_u8(self.at_state.load(Ordering::Relaxed))
     }
 
     pub async fn last_report(&self) -> Option<SwitchReport> {

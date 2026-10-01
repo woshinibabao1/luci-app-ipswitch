@@ -41,13 +41,25 @@
 |---|---|---|---|---|
 | GET | `/switch` | 200 | `text/plain; charset=utf-8` | **换一次出口 IP**，chunked 流式返回进度 |
 | GET | `/status` | 200 | `application/json; charset=utf-8` | 只读状态探针，**不下发任何写命令** |
-| GET | `/` | 200 | `text/plain; charset=utf-8` | 存活探测，body = `ipswitchd ok` |
-| GET | `/health` | 200 | `text/plain; charset=utf-8` | 同上（`/` 与 `/health` 是同一个分支） |
+| GET | `/` | 200 | `text/plain; charset=utf-8` | 极简存活探测，body = `ipswitchd ok` |
+| GET | `/health` | 200 / **503** | `text/plain; charset=utf-8` | 存活 + AT 通道可达性；AT 探活失败给 503 |
 | 其它 | 任意 | 404 | `text/plain; charset=utf-8` | body = `Not Found` |
 | 非 GET | 任意 | 405 | `text/plain; charset=utf-8` | body = `只支持 GET` |
 | 请求行解析失败 | — | 400 | `text/plain; charset=utf-8` | body = `Bad Request` |
+| 连接数超上限 | 任意 | **503** | `text/plain; charset=utf-8` | body = `连接数已达上限，请稍后重试` |
 
-`reason` 短语表（`httpd.rs:260`）：`200 OK` / `400 Bad Request` / `404 Not Found` / `405 Method Not Allowed`。
+`reason` 短语表：`200 OK` / `400 Bad Request` / `404 Not Found` / `405 Method Not Allowed` / `503 Service Unavailable`。
+
+### 客户端资源上限（面向不可信来源）
+
+这个端口没有鉴权，默认依赖 OpenWrt WAN 侧 input 策略拦截外部来源，所以每条连接都有硬上限
+（取舍见 [adr/0006](adr/0006-resource-bounds-for-untrusted-clients.md)）：
+
+| 上限 | 值 | 表现 |
+|---|---|---|
+| 单行长度（**读取期**生效） | 8192 字节 | 超长 / 不发换行的请求：直接关连接 |
+| 单次写出 | 10s | 超时按"调用方已走"处理：丢弃进度，**切换照跑** |
+| 并发连接数 | 32 | 超出时新连接得到 503 并关闭 |
 
 ---
 
@@ -139,6 +151,7 @@ curl -sN http://192.168.10.1:8790/switch | grep -q 'IP切换完成' && echo OK |
   "wan_ip": "10.76.139.149",
   "dial_active": true,
   "dial_raw": "^NDISSTATQRY: 1,...",
+  "at_channel": "ok",
   "method": "redial",
   "marker": "IP切换完成",
   "apn_pool_size": 0,
@@ -163,6 +176,7 @@ curl -sN http://192.168.10.1:8790/switch | grep -q 'IP切换完成' && echo OK |
 | `wan_ip` | string \| null | 该接口的 IPv4 地址；`null` = 没读到 |
 | `dial_active` | bool \| null | 模组拨号状态。**`null` = 本次没读出来**，与 `false`（读出来了、未连接）严格区分 |
 | `dial_raw` | string \| null | `AT^NDISSTATQRY?` 原始回显 |
+| `at_channel` | string | **启动时** AT 通道探活结果：`ok` / `failed` / `unknown`（还没探过）。`failed` 说明"服务活着但干不了活" |
 | `method` | string | **生效的**策略：`redial` 或 `apn`（`apn` + 空池会显示 `redial`） |
 | `marker` | string | 当前标记文本 |
 | `apn_pool_size` | number | `apn_list` 条目数 |
@@ -186,6 +200,8 @@ curl -sN http://192.168.10.1:8790/switch | grep -q 'IP切换完成' && echo OK |
 
 ## 5. `GET /` 与 `GET /health` —— 存活探测
 
+### `GET /`
+
 ```
 HTTP/1.1 200 OK
 Content-Type: text/plain; charset=utf-8
@@ -195,7 +211,43 @@ Connection: close
 ipswitchd ok
 ```
 
-**不碰模组、不碰 AT 通道**，可放心当高频心跳用。
+**不碰模组、不碰 AT 通道**，可放心当高频心跳用。永远是 200。
+
+### `GET /health`
+
+在上面那份 body 后面**追加一行 JSON**，并按 AT 通道探活结果给状态码：
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+
+ipswitchd ok
+{"at_channel":"ok","status":"ok"}
+```
+
+AT 通道**明确探活失败**时（`main.rs` 启动探活失败并记录下来）：
+
+```
+HTTP/1.1 503 Service Unavailable
+Content-Type: text/plain; charset=utf-8
+
+ipswitchd ok
+{"at_channel":"failed","status":"degraded"}
+```
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `at_channel` | string | `ok` / `failed` / `unknown`（还没探过） |
+| `status` | string | `failed` 时是 `degraded`，否则 `ok` |
+
+两个要点：
+
+- **`ipswitchd ok` 前缀保留**：既有脚本是拿 `grep "ipswitchd ok"` 判活的，
+  直接换成纯 JSON 会让它们静默失效 —— 宁可多一行 JSON。
+- **`unknown` 不算失败**（给 200）：启动探活失败并不阻止服务启动（后端可能稍后就绪），
+  所以"没探过"≠"干不了活"。
+- 这一条**也不碰设备**：只读内存里的一个状态量，可以高频调用。
+  （对比：`/status` 会真的下发一条只读的 `AT^NDISSTATQRY?`，通道忙时可能等上十几秒。）
 
 ---
 

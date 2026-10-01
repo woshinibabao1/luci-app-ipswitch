@@ -24,7 +24,7 @@ use std::process::exit;
 
 use config::Config;
 use rpc::AtClient;
-use switcher::Switcher;
+use switcher::{AtState, Switcher};
 
 fn main() {
     // 刻意不用 #[tokio::main]：路由器上只需要很小的运行时就够
@@ -74,21 +74,28 @@ async fn run() -> Result<(), String> {
 
     let at = AtClient::new(cfg.rpc_host.clone(), cfg.rpc_port, auth_key);
 
+    // Switcher 先建：启动探活的结果要记在它身上，才能被 /health、/status 看到。
+    let sw = Switcher::new(cfg.clone(), at.clone());
+
     // 启动期探一次 AT 通道：把"后端没跑 / 密钥不对 / 串口没起来"
     // 这类问题暴露在这里，而不是等第一次切换时才失败。
-    // 探活失败**不阻止启动** —— 后端可能稍后才就绪，服务先挂着比反复重启好。
+    // 探活失败**不阻止启动** —— 后端可能稍后才就绪，服务先挂着比反复重启好；
+    // 但结果会记进 Switcher，让 /health 能区分"服务活着"与"服务能干活"。
     match at.send("AT").await {
         Ok(r) if r.success => {
             eprintln!("[ipswitch] AT 通道连通");
+            sw.set_at_state(AtState::Ok);
         }
         Ok(r) => {
             eprintln!(
                 "[ipswitch] 警告: AT 通道有应答但非成功: {}（首次切换可能失败）",
                 r.text()
             );
+            sw.set_at_state(AtState::Failed);
         }
         Err(e) => {
             eprintln!("[ipswitch] 警告: AT 通道不可用: {e}（首次切换可能失败）");
+            sw.set_at_state(AtState::Failed);
         }
     }
 
@@ -100,7 +107,6 @@ async fn run() -> Result<(), String> {
         );
     }
 
-    let sw = Switcher::new(cfg.clone(), at);
     httpd::serve(cfg, sw)
         .await
         .map_err(|e| format!("HTTP 服务异常退出: {e}"))
