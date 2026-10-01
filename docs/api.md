@@ -46,9 +46,11 @@
 | 其它 | 任意 | 404 | `text/plain; charset=utf-8` | body = `Not Found` |
 | 非 GET | 任意 | 405 | `text/plain; charset=utf-8` | body = `只支持 GET` |
 | 请求行解析失败 | — | 400 | `text/plain; charset=utf-8` | body = `Bad Request` |
+| 读请求头超总时长 | — | **408** | `text/plain; charset=utf-8` | body = `请求头读取超时` |
+| 请求头行数 > 64 | — | **431** | `text/plain; charset=utf-8` | body = `请求头行数过多` |
 | 连接数超上限 | 任意 | **503** | `text/plain; charset=utf-8` | body = `连接数已达上限，请稍后重试` |
 
-`reason` 短语表：`200 OK` / `400 Bad Request` / `404 Not Found` / `405 Method Not Allowed` / `503 Service Unavailable`。
+`reason` 短语表：`200 OK` / `400 Bad Request` / `404 Not Found` / `405 Method Not Allowed` / `408 Request Timeout` / `431 Request Header Fields Too Large` / `503 Service Unavailable`。
 
 ### 客户端资源上限（面向不可信来源）
 
@@ -181,7 +183,12 @@ curl -sN http://192.168.10.1:8790/switch | grep -q 'IP切换完成' && echo OK |
 | `marker` | string | 当前标记文本 |
 | `apn_pool_size` | number | `apn_list` 条目数 |
 | `timeout_secs` | number | 单次切换上限 |
-| `last_switch` | object \| null | **本进程内**上一次切换报告；从未切过则是 `null` |
+| `last_attempt` | object \| null | **最近一次尝试**（成功失败都记）。失败时 `ok:false` 且带 `err`/`note` —— 只看 `last_switch` 会把"一直失败"误读成"一直成功" |
+| `last_attempt.at_unix` | number | 该次尝试的 Unix 时间戳（秒） |
+| `last_attempt.ok` | bool | 该次尝试是否成功 |
+| `last_attempt.err` | string \| null | 失败原因 |
+| `last_attempt.note` | string \| null | 补充说明（例如"忙：本次未执行"） |
+| `last_switch` | object \| null | **本进程内**最后一次**成功**的切换报告；从未成功过则是 `null` |
 | `last_switch.method` | string | 该次实际用的策略 |
 | `last_switch.apn` | string \| null | 该次切到的 APN（`redial` 时为 `null`） |
 | `last_switch.before` / `after` | string \| null | 切换前 / 后的接口地址 |

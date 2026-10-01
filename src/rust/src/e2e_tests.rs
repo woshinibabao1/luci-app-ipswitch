@@ -400,21 +400,49 @@ async fn root_and_health_report_ok() {
     assert!(http_get(addr, "/health").await.contains("200 OK"));
 }
 
-#[tokio::test]
-async fn apn_strategy_switches_apn_and_reports_it() {
-    let rpc = spawn_fake_rpc(|cmd| {
+/// 换 APN 的假后端：**真的记住写入的 APN**，回读时如实吐出来。
+///
+/// ★ 为什么不能像原来那样"`AT^SETAUTODIAL?` 永远回 cmnet"：
+/// 那样写入等于没生效，而"回读 APN 与期望不符才报错"的校验就被绕过了 ——
+/// 用例会假绿（实测：这类假后端下，即使校验逻辑写反也照样通过）。
+/// 假后端必须**应用**写入，用例才验得到真行为。
+async fn spawn_apn_applying_rpc(initial_apn: &str) -> FakeRpc {
+    let apn = Arc::new(Mutex::new(initial_apn.to_string()));
+    let apn_srv = apn.clone();
+
+    spawn_fake_rpc(move |cmd| {
         if cmd == "AT^NDISSTATQRY?" {
             return (true, "^NDISSTATQRY: 1,0,,\"IPV4\"\r\nOK".to_string());
         }
         if cmd == "AT^SETAUTODIAL?" {
+            let cur = apn_srv.lock().unwrap().clone();
             return (
                 true,
-                "^SETAUTODIAL:1,1,\"IP\",\"cmnet\",\"\",\"\",0\r\nOK".to_string(),
+                format!("^SETAUTODIAL:1,1,\"IP\",\"{cur}\",\"\",\"\",0\r\nOK"),
             );
+        }
+        if let Some(rest) = cmd.strip_prefix("AT^SETAUTODIAL=1,") {
+            // 形态：<mode>,"<proto>","<apn>",...
+            let mut it = rest.splitn(3, ',');
+            let _mode = it.next();
+            let _proto = it.next();
+            if let Some(tail) = it.next() {
+                let tail = tail.trim_start_matches('"');
+                let applied = tail.split('"').next().unwrap_or("").to_string();
+                if !applied.is_empty() {
+                    *apn_srv.lock().unwrap() = applied;
+                }
+            }
+            return (true, "OK".to_string());
         }
         (true, "OK".to_string())
     })
-    .await;
+    .await
+}
+
+#[tokio::test]
+async fn apn_strategy_switches_apn_and_reports_it() {
+    let rpc = spawn_apn_applying_rpc("cmnet").await;
 
     let mut cfg = test_config(rpc.addr.port());
     cfg.method = crate::config::Method::Apn;
@@ -422,7 +450,10 @@ async fn apn_strategy_switches_apn_and_reports_it() {
     let addr = start_server(cfg).await;
 
     let body = http_get(addr, "/switch").await;
-    assert!(body.contains("IP切换完成"), "{body}");
+    assert!(
+        body.contains("IP切换完成"),
+        "★ 切 APN 成功时必须吐标记（旧实现拿「切换前 APN」当期望值，写入一生效就报错）: {body}"
+    );
 
     let cmds = rpc.commands();
     let up = cmds
@@ -499,9 +530,15 @@ async fn read_line_is_bounded_by_max_line() {
         limit: SAFETY_LIMIT,
     });
 
-    let got = tokio::time::timeout(Duration::from_secs(5), httpd::read_line(&mut reader))
-        .await
-        .expect("read_line 必须在上限处返回，而不是一直读下去");
+    let got = tokio::time::timeout(
+        Duration::from_secs(5),
+        httpd::read_line(
+            &mut reader,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("read_line 必须在上限处返回，而不是一直读下去");
 
     let n = served.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
@@ -543,6 +580,67 @@ async fn client_that_never_reads_does_not_hold_the_connection_task() {
         .await
         .expect("第一个连接结束后，服务端没有在 20s 内继续响应新请求");
     assert!(body.contains("200 OK"), "{body}");
+}
+
+/// 请求头行数有上限：不能靠"每行都在超时内"把连接永久占住。
+///
+/// 单行超时挡不住"每 9 秒发一行、永不发结束空行"——那种连接会一直占着
+/// MAX_CONNECTIONS 的额度，占满后所有新连接（含合法的 /switch）都会拿到 503。
+///
+/// 变异验证：去掉 MAX_HEADER_LINES / HEAD_TOTAL_TIMEOUT 的判断 → 服务端不回 431，
+/// 本用例在 5s 内读不到响应（既没响应也没断连）而判红。
+#[tokio::test]
+async fn too_many_header_lines_is_rejected() {
+    let (rpc, _) = spawn_automaton_rpc(true).await;
+    let addr = start_server(test_config(rpc.addr.port())).await;
+
+    let mut s = TcpStream::connect(addr).await.expect("连接 HTTP 服务");
+    let mut req = String::from("GET /health HTTP/1.1\r\n");
+    for i in 0..200 {
+        req.push_str(&format!("X-Pad-{i}: v\r\n"));
+    }
+    // ★ 刻意不发结束空行
+    s.write_all(req.as_bytes()).await.unwrap();
+    s.flush().await.unwrap();
+
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+    assert!(
+        read.is_ok(),
+        "发 200 行请求头后服务端既没回响应也没关连接：连接可以被永久占住"
+    );
+    let text = String::from_utf8_lossy(&buf);
+    assert!(
+        text.contains("431"),
+        "应当明确回 431（请求头行数过多），实际响应: {text}"
+    );
+}
+
+/// 客户端在读请求头期间断开：这是**不完整请求**，不得触发真实换 IP。
+///
+/// 换 IP 是有副作用的动作（会断网），不该由半个请求引发。
+#[tokio::test]
+async fn truncated_request_does_not_trigger_a_switch() {
+    let (rpc, _) = spawn_automaton_rpc(true).await;
+    let addr = start_server(test_config(rpc.addr.port())).await;
+
+    {
+        let mut s = TcpStream::connect(addr).await.expect("连接 HTTP 服务");
+        // 只有请求行 + 一个 header，**没有结束空行**，然后立刻断开
+        s.write_all(b"GET /switch HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        s.flush().await.unwrap();
+    }
+
+    // 给"万一真的触发了切换"留出足够时间
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let cmds = rpc.commands();
+    assert!(
+        !cmds.iter().any(|c| c == "AT^SETAUTODIAL=0"),
+        "★ 截断的请求不得触发换 IP（副作用不该由半个请求引发）: {cmds:?}"
+    );
 }
 
 // ─────────────────── /health 要能反映"能不能干活" ───────────────────
@@ -598,6 +696,111 @@ async fn root_stays_minimal_even_when_at_is_down() {
     let body = http_get(addr, "/").await;
     assert!(body.contains("200 OK"), "{body}");
     assert!(body.contains("ipswitchd ok"), "{body}");
+}
+
+/// 失败的切换也必须留痕：`/status.last_attempt.ok` 为 false 且带原因。
+///
+/// ★ 只在成功时写 `last_switch` 的话，切换失败之后 `/status` 依旧显示上一次的
+/// "成功" —— 看起来一切正常，而这正是排查时最需要看的那一刻。
+#[tokio::test]
+async fn failed_switch_is_recorded_in_status() {
+    // 假模组：拒绝重新拨号 → 切换必然失败
+    let rpc = spawn_fake_rpc(|cmd| {
+        if cmd == "AT^NDISSTATQRY?" {
+            return (true, "^NDISSTATQRY: 0,0,,\"IPV4\"\r\nOK".to_string());
+        }
+        if cmd.starts_with("AT^SETAUTODIAL=1") {
+            return (false, "ERROR".to_string());
+        }
+        (true, "OK".to_string())
+    })
+    .await;
+
+    let addr = start_server(test_config(rpc.addr.port())).await;
+
+    // 先确认切换确实失败了
+    let switch_body = http_get(addr, "/switch").await;
+    assert!(switch_body.contains("切换失败"), "{switch_body}");
+
+    // 再看 /status：必须记录这次失败，而不是停留在"从没切过"
+    let status = http_get(addr, "/status").await;
+    assert!(
+        status.contains("\"last_attempt\""),
+        "/status 应带 last_attempt 字段: {status}"
+    );
+    assert!(
+        status.contains("\"ok\":false"),
+        "★ 失败的切换必须记成 ok:false（否则看起来一切正常）: {status}"
+    );
+    assert!(
+        status.contains("\"last_switch\":null"),
+        "从未成功过，last_switch 应仍为 null: {status}"
+    );
+}
+
+/// 忙拒绝也要留痕（"调用方想要、但本次没执行"同样是一次尝试）。
+///
+/// ★ 判据要选对：两个请求并发跑，谁**最后**写 `last_attempt` 取决于时序
+/// （被拒的那个通常立刻返回、成功那个还在等，但调度不保证）。
+/// 所以这里断言的是**状态机不变式**，而不是"最后一条一定是拒绝"：
+///
+///	last_attempt.ok == false ⟹ 必须带着原因（err 或 note 不能都为空）
+///
+/// 这条不变式在被拒时会被破：拒绝只留 ok:false、没有原因的话，
+/// 排查时看到的就是"失败但不知道为什么"。
+#[tokio::test]
+async fn busy_rejection_is_recorded_in_status() {
+    let (rpc, _) = spawn_automaton_rpc(true).await;
+    let addr = start_server(test_config(rpc.addr.port())).await;
+
+    let a = http_get(addr, "/switch");
+    let b = http_get(addr, "/switch");
+    let (ra, rb) = tokio::join!(a, b);
+    assert!(
+        ra.contains("已有一次切换正在进行中") || rb.contains("已有一次切换正在进行中"),
+        "并发第二个请求应被拒绝: {ra} / {rb}"
+    );
+
+    let status = http_get(addr, "/status").await;
+    assert!(status.contains("\"last_attempt\""), "{status}");
+
+    // 不变式一：失败必须带原因。
+    if status.contains("\"ok\":false") {
+        let has_reason = status.contains("\"err\":\"") || status.contains("\"note\":\"");
+        assert!(
+            has_reason,
+            "★ last_attempt 记成失败却没带任何原因（err/note 都空）: {status}"
+        );
+    }
+    // 不变式二：成功过就必须有 last_switch（两个字段不能互相矛盾）。
+    if status.contains("\"ok\":true") {
+        assert!(
+            !status.contains("\"last_switch\":null"),
+            "★ 报告 ok:true 却没有 last_switch，两个字段自相矛盾: {status}"
+        );
+    }
+}
+
+/// `/status` 与 `/health` 都不许因为"失败过"而改口径：
+/// `/status` 永远 200（它是探针），`/health` 只看 AT 通道可达性。
+#[tokio::test]
+async fn status_stays_200_even_after_a_failed_switch() {
+    let rpc = spawn_fake_rpc(|cmd| {
+        if cmd == "AT^NDISSTATQRY?" {
+            return (true, "^NDISSTATQRY: 0,0,,\"IPV4\"\r\nOK".to_string());
+        }
+        if cmd.starts_with("AT^SETAUTODIAL=1") {
+            return (false, "ERROR".to_string());
+        }
+        (true, "OK".to_string())
+    })
+    .await;
+
+    let addr = start_server(test_config(rpc.addr.port())).await;
+    let _ = http_get(addr, "/switch").await; // 必然失败
+
+    let status = http_get(addr, "/status").await;
+    assert!(status.starts_with("HTTP/1.1 200 OK"), "{status}");
 }
 
 /// 未设置探活结果（`Unknown`）时不报 degraded —— 后端可能稍后才就绪，

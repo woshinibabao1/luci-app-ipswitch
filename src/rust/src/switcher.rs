@@ -118,6 +118,21 @@ pub struct ProbeReport {
     pub dial_raw: String,
 }
 
+/// 最近一次切换**尝试**的结果，成功失败都记。
+///
+/// ★ 为什么失败也要记：只在成功时写 `last_report` 的话，切换失败之后 `/status`
+/// 依旧显示上一次的"成功" —— 看起来一切正常，而这正是排查时最需要看的那一刻。
+#[derive(Debug, Clone)]
+pub struct LastAttempt {
+    /// 尝试开始的 Unix 时间戳（秒）。
+    pub at_unix: u64,
+    pub ok: bool,
+    /// 失败原因（`ok=true` 时为 `None`）。
+    pub err: Option<String>,
+    /// 补充说明（例如"忙：本次未执行"）。
+    pub note: Option<String>,
+}
+
 /// `AT^SETAUTODIAL?` 解析出来的配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutodialCfg {
@@ -145,8 +160,10 @@ pub struct Switcher {
     lock: Mutex<()>,
     /// APN 池轮换游标。
     apn_cursor: AtomicUsize,
-    /// 最近一次切换结果，供 `/status` 查阅。
+    /// 最近一次切换结果（**仅成功**），供 `/status.last_switch` 查阅。
     last: Mutex<Option<SwitchReport>>,
+    /// 最近一次切换**尝试**（成功失败都记），供 `/status.last_attempt` 查阅。
+    last_attempt: Mutex<Option<LastAttempt>>,
     /// AT 通道可达性（启动探活结果），供 `/health` 与 `/status` 查阅。
     at_state: AtomicU8,
 }
@@ -159,6 +176,7 @@ impl Switcher {
             lock: Mutex::new(()),
             apn_cursor: AtomicUsize::new(0),
             last: Mutex::new(None),
+            last_attempt: Mutex::new(None),
             at_state: AtomicU8::new(AtState::Unknown.as_u8()),
         })
     }
@@ -179,6 +197,30 @@ impl Switcher {
 
     pub async fn last_report(&self) -> Option<SwitchReport> {
         self.last.lock().await.clone()
+    }
+
+    /// 最近一次切换**尝试**（含失败），供 `/status` 查阅。
+    pub async fn last_attempt(&self) -> Option<LastAttempt> {
+        self.last_attempt.lock().await.clone()
+    }
+
+    /// 记录一次尝试（成功失败都记）。
+    async fn record_attempt(&self, ok: bool, err: Option<String>, note: Option<String>) {
+        let at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        *self.last_attempt.lock().await = Some(LastAttempt {
+            at_unix,
+            ok,
+            err,
+            note,
+        });
+    }
+
+    /// 记忆一次成功切换（`last_switch` 的来源）。
+    async fn remember(&self, report: &SwitchReport) {
+        *self.last.lock().await = Some(report.clone());
     }
 
     /// 只读探针：不改任何设备状态，供 `/status` 使用。
@@ -213,6 +255,12 @@ impl Switcher {
     /// 3. "忙"是一个**可诊断的原因**，值得如实报出来，而不是伪装成"切换很慢"。
     ///
     /// 调用方拿到这个错误立即重试即可 —— 反正一次切换只需要几十秒。
+    ///
+    /// ## 失败也要留痕
+    ///
+    /// ★ 主体包在 `outcome` 里跑，**成功与失败都会写进 `last_attempt`**。
+    /// 原来只在成功时写 `last_report`：切换失败之后 `/status` 依旧显示上一次的
+    /// "成功"，看起来一切正常 —— 而这正是排查时最需要看的那一刻。
     pub async fn switch_ip(
         &self,
         tx: &mpsc::UnboundedSender<String>,
@@ -221,6 +269,13 @@ impl Switcher {
         let _guard = match self.lock.try_lock() {
             Ok(g) => g,
             Err(_) => {
+                // 忙拒绝也留痕：它同样是一次"调用方想要但没执行"的请求。
+                self.record_attempt(
+                    false,
+                    None,
+                    Some("已有一次切换正在进行中（本次未执行）".to_string()),
+                )
+                .await;
                 return Err(format!(
                     "已有一次切换正在进行中，请稍后重试（本次未执行；单次切换上限 {}s）",
                     self.cfg.timeout.as_secs()
@@ -228,6 +283,23 @@ impl Switcher {
             }
         };
 
+        let outcome = self.run_switch(tx, started).await;
+        match &outcome {
+            Ok(report) => {
+                self.remember(report).await;
+                self.record_attempt(true, None, None).await;
+            }
+            Err(e) => self.record_attempt(false, Some(e.clone()), None).await,
+        }
+        outcome
+    }
+
+    /// 切换主体：完成时把成功报告写进 `last_report`。
+    async fn run_switch(
+        &self,
+        tx: &mpsc::UnboundedSender<String>,
+        started: Instant,
+    ) -> Result<SwitchReport, String> {
         let deadline = started + self.cfg.timeout;
         let iface = self.cfg.wan_iface.as_str();
         let method = self.cfg.effective_method();
@@ -295,13 +367,28 @@ impl Switcher {
         let settle = remaining(deadline, SETTLE_BUDGET);
         let after = self.confirm_ready(settle, tx).await?;
 
-        // ── ⑦ 回读 APN，确认没被清掉 ────────────────────────────
-        if let (Some(old), Some(now)) = (apn_before.as_ref(), self.read_autodial().await) {
-            if !old.apn.is_empty() && now.apn != old.apn {
+        // ── ⑦ 回读 APN，确认它等于**本次期望值** ────────────────
+        //
+        // ★ 期望值随策略而变，不能一律拿"切换前"去比：
+        //
+        //	apn 策略：期望就是本次轮到的那个 APN（`next_apn`），变了才是对的；
+        //	redial：期望仍是切换前那个（ADR 0003：省略 APN 可能被模组清空）。
+        //
+        // 原来一律跟 `apn_before` 比 —— 于是 apn 策略**只要写入生效就报错中止**，
+        // 而模组静默拒绝写入时反而"校验通过"。这与该功能的目的正好相反。
+        //
+        // 另外：`None` 表示"没读出来"，不是"被清空了"，不能据此判失败。
+        let expect_apn: Option<String> = match (&apn, apn_before.as_ref()) {
+            (Some(target), _) => Some(target.clone()), // apn 策略：期望切到目标
+            (None, Some(old)) if !old.apn.is_empty() => Some(old.apn.clone()),
+            _ => None, // 没读到原配置：退化成省略形态，无从校验
+        };
+        if let (Some(expect), Some(now)) = (expect_apn.as_ref(), self.read_autodial().await) {
+            if !now.apn.is_empty() && now.apn != *expect {
                 return Err(format!(
-                    "APN 在切换过程中发生变化（{} → {}），已中止以免在错误的 APN 上继续。\
+                    "回读 APN 与本次期望不符（期望「{expect}」，实际「{}」），已中止以免在错误的 APN 上继续。\
                      请在 MT5700 Console 的「自动拨号与 APN」里核对。",
-                    old.apn, now.apn
+                    now.apn
                 ));
             }
         }
@@ -315,7 +402,8 @@ impl Switcher {
             renewed_by,
             elapsed: started.elapsed(),
         };
-        *self.last.lock().await = Some(report.clone());
+        // 注意：`last_switch` 由 switch_ip 统一写（它同时负责记录失败），这里不写，
+        // 否则会出现两条写入路径、以后改一处忘一处。
 
         emit(
             tx,
@@ -385,20 +473,29 @@ impl Switcher {
     }
 
     /// 发一条 AT，非 OK 即失败。成功时把回显第一行写进进度流。
+    ///
+    /// ★ 这里写进进度流的命令会**原样出现在 /switch 的响应体、调用方日志、
+    /// 以及 /status.last_attempt.err 里**。而 `AT^SETAUTODIAL=1,...,"<apn>",
+    /// "<user>","<pass>",...` 里带着 PPP 账号密码（回读自模组，见 ADR 0003），
+    /// 这个端口又默认监听 0.0.0.0 且无鉴权 —— 等于把凭据广播到局域网。
+    /// 所以一律先过 [`redact_at`] 再输出。
     async fn run_at(
         &self,
         tx: &mpsc::UnboundedSender<String>,
         cmd: &str,
     ) -> Result<AtReply, String> {
+        let shown = redact_at(cmd);
         let reply = self
             .at
             .send(cmd)
             .await
-            .map_err(|e| format!("AT 通道调用失败（{cmd}）: {e}"))?;
+            .map_err(|e| format!("AT 通道调用失败（{shown}）: {e}"))?;
+        // 回显也要打码：回读应答的第一行 `^SETAUTODIAL:...` 同样带账号密码。
+        let echo = redact_at_reply(&first_line(reply.text()));
         if !reply.success {
-            return Err(format!("模组拒绝 `{cmd}`: {}", first_line(reply.text())));
+            return Err(format!("模组拒绝 `{shown}`: {echo}"));
         }
-        emit(tx, format!("  {cmd} → {}", first_line(reply.text())));
+        emit(tx, format!("  {shown} → {echo}"));
         Ok(reply)
     }
 
@@ -449,10 +546,9 @@ impl Switcher {
         }
     }
 
-    /// 最终确认：模组说"已连接"**且**接口上确实有地址。
+    /// 最终确认：以**模组侧状态**为准，接口地址只作参考。
     ///
-    /// 两个条件缺一不可 —— 只看模组会漏掉"netifd 没把地址接过来"，
-    /// 只看接口地址会漏掉"租约还没过期但 PDP 已经断了"。
+    /// 判据与取舍见 [`judge_ready`]（纯函数，可单测）。
     async fn confirm_ready(
         &self,
         budget: Duration,
@@ -462,6 +558,8 @@ impl Switcher {
         let mut errs = 0u32;
         let mut last_note = String::new();
         let mut best: Option<Ipv4Addr> = None;
+        // 最后一次成功读到的模组状态（None = 从没读到过）。
+        let mut last_active: Option<bool> = None;
 
         loop {
             match self.at.send("AT^NDISSTATQRY?").await {
@@ -469,7 +567,18 @@ impl Switcher {
                     errs = 0;
                     best = netif::ipv4_of(&self.cfg.wan_iface);
                     let active = parse_ndis_active(reply.text());
-                    if active == Some(true) && best.is_some() {
+                    last_active = active;
+                    if active == Some(true) {
+                        // 模组已连上即算就绪（理由见 judge_ready）。
+                        if best.is_none() {
+                            emit(
+                                tx,
+                                format!(
+                                    "  模组已连接，但 {} 暂未读到 IPv4 地址（renew 可能还在跑）",
+                                    self.cfg.wan_iface
+                                ),
+                            );
+                        }
                         return Ok(best);
                     }
                     let note = format!("拨号状态={active:?} 接口地址={}", fmt_ip(best));
@@ -486,12 +595,43 @@ impl Switcher {
                 }
             }
             if Instant::now() >= deadline {
-                // 模组已连接但接口还没地址：不判失败（renew 可能还在跑），
-                // 返回已知的最佳结果，由调用方从 report 里自行判断。
-                return Ok(best);
+                return judge_ready(last_active, best, budget, &self.cfg.wan_iface);
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
+    }
+}
+
+/// 预算耗尽时判定"这次切换算不算成功"。
+///
+/// ★ 唯一权威判据是**模组自己说已连接**。接口地址只作参考，因为真机上它可能是
+/// **上一次租约残留的地址**（ADR 0002：模组内部 DHCP 租约能挂 6 天，PDP 断了
+/// netifd 也不一定重跑 DHCP）—— "接口上有地址"根本不等于"连上了"。
+///
+/// 原来的实现 `return Ok(best)`（只回地址、不看模组状态）会让调用方拿到
+/// **假成功标记**：模组明明断着，调用方却以为换好了、继续发请求，然后成片失败。
+/// 宁可判失败（调用方会重试），也不要给假成功。
+///
+/// 反过来，"模组已连接但接口还没地址"**不算失败**：`renew` 那一步已经触发过
+/// DHCP，地址可能还在路上；而调用方（zgyd）另有自己的静置窗口去等路径生效。
+fn judge_ready(
+    last_active: Option<bool>,
+    best: Option<Ipv4Addr>,
+    budget: Duration,
+    iface: &str,
+) -> Result<Option<Ipv4Addr>, String> {
+    match last_active {
+        Some(true) => Ok(best), // 模组已连接：就绪（地址可选）
+        Some(false) => Err(format!(
+            "模组在 {:.1}s 内仍未恢复连接（拨号状态=未连接；接口地址={}）。\
+             可到 MT5700 Console「运行日志 → 模组拨号」看模组侧原因。",
+            budget.as_secs_f64(),
+            best.map(|a| a.to_string()).unwrap_or_else(|| "无".into())
+        )),
+        None => Err(format!(
+            "在 {:.1}s 内没能读到模组（{iface}）的拨号状态，无法确认本次切换是否成功",
+            budget.as_secs_f64()
+        )),
     }
 }
 
@@ -584,6 +724,61 @@ fn split_csv_fields(s: &str) -> Vec<String> {
 /// 净化要写进 AT 命令引号内的参数（与 `config::sanitize_at_param` 同一目的）。
 fn sanitize(s: &str) -> String {
     crate::config::sanitize_at_param(s)
+}
+
+/// 把 AT 命令里可能携带**凭据**的字段打码，用于日志/响应体。
+///
+/// 只处理已知会带凭据的那一条：`AT^SETAUTODIAL=1,<mode>,"<proto>","<apn>",
+/// "<user>","<pass>",<auth>` —— 第 5、6 个字段是 PPP 账号密码。
+///
+/// 保留结构（让读日志的人知道"确实带了账号密码，只是没显示"），
+/// 但把值换成 `***`。其余命令原样返回（`AT^SETAUTODIAL?` 的回读应答不进这里；
+/// 它的 `data` 会被 `run_at` 只取第一行，而第一行是 `^SETAUTODIAL:...`，
+/// 同样含凭据 —— 所以下面连回显也一起处理）。
+fn redact_at(cmd: &str) -> String {
+    let Some(rest) = cmd.strip_prefix("AT^SETAUTODIAL=1,") else {
+        return cmd.to_string();
+    };
+    // 逗号切分但尊重引号（复用解析用的那套）
+    let fields = split_csv_fields(rest);
+    if fields.len() < 6 {
+        return cmd.to_string(); // 省略形态（=1,<mode>）没有凭据
+    }
+    format!(
+        "AT^SETAUTODIAL=1,{},\"{}\",\"{}\",\"***\",\"***\",{}",
+        fields[0],
+        fields[1],
+        fields[2],
+        fields[6.min(fields.len() - 1)]
+    )
+}
+
+/// 净化 AT 回显（`^SETAUTODIAL:...`）里的账号密码字段。
+///
+/// ★ 回读应答的状态行同样带凭据（形如 `^SETAUTODIAL:1,1,"IP","cmnet","user","pw",0`），
+/// 而 `run_at` 会把第一行原样写进进度流 —— 只打码命令、不打码回显等于没打码。
+fn redact_at_reply(text: &str) -> String {
+    for line in text.replace('\r', "\n").lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("^SETAUTODIAL:")
+            .or_else(|| line.strip_prefix("^SETAUTODAIL:"))
+        else {
+            continue;
+        };
+        let fields = split_csv_fields(rest.trim());
+        if fields.len() >= 6 {
+            return format!(
+                "^SETAUTODIAL: {}, {}, \"{}\", \"{}\", \"***\", \"***\", {}",
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[6.min(fields.len() - 1)]
+            );
+        }
+    }
+    text.to_string()
 }
 
 // ─────────────────────────── 小工具 ───────────────────────────
@@ -768,5 +963,80 @@ mod tests {
             "^SETAUTODIAL: 1,1"
         );
         assert_eq!(first_line(""), "");
+    }
+
+    // ── judge_ready：预算耗尽时的成功/失败裁决 ──
+
+    #[test]
+    fn judge_ready_ok_when_modem_connected() {
+        let addr: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        assert_eq!(
+            judge_ready(Some(true), Some(addr), Duration::from_secs(6), "MT5700M"),
+            Ok(Some(addr))
+        );
+    }
+
+    #[test]
+    fn judge_ready_ok_even_without_interface_address() {
+        // "模组已连接但接口还没地址"不算失败：renew 已经触发过 DHCP，地址可能还在路上；
+        // 调用方（zgyd）另有自己的静置窗口。（现有 e2e 用例正是这条路径。）
+        assert_eq!(
+            judge_ready(Some(true), None, Duration::from_secs(6), "MT5700M"),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn judge_ready_fails_when_modem_disconnected_even_with_stale_address() {
+        // ★ 这条是修正的核心：接口上残留着上一次租约的地址（ADR 0002 的 6 天租约坑），
+        //   但模组自己说没连上 —— 必须判失败，否则调用方会拿到**假成功标记**。
+        let stale: Ipv4Addr = "10.76.139.149".parse().unwrap();
+        let got = judge_ready(Some(false), Some(stale), Duration::from_secs(6), "MT5700M");
+        let err = got.expect_err("模组未连接时必须判失败，不能拿残留地址当成功");
+        assert!(err.contains("仍未恢复连接"), "{err}");
+        assert!(
+            err.contains("10.76.139.149"),
+            "错误里应带上残留地址便于排查: {err}"
+        );
+    }
+
+    #[test]
+    fn judge_ready_fails_when_state_never_read() {
+        let err = judge_ready(None, None, Duration::from_secs(6), "MT5700M")
+            .expect_err("一次都没读到模组状态时不能假装成功");
+        assert!(err.contains("没能读到"), "{err}");
+    }
+
+    // ── 凭据打码 ──
+
+    #[test]
+    fn redact_strips_ppp_credentials_from_command() {
+        let cmd = "AT^SETAUTODIAL=1,1,\"IP\",\"cmnet\",\"user1\",\"s3cret\",1";
+        let out = redact_at(cmd);
+        assert!(!out.contains("user1"), "账号不该出现在日志里: {out}");
+        assert!(
+            !out.contains("s3cret"),
+            "★ 密码绝不能出现在日志/响应体里: {out}"
+        );
+        assert!(out.contains("cmnet"), "非敏感字段应保留，便于排查: {out}");
+    }
+
+    #[test]
+    fn redact_keeps_short_form_and_other_commands_intact() {
+        // 省略形态没有凭据，原样返回
+        assert_eq!(redact_at("AT^SETAUTODIAL=1,1"), "AT^SETAUTODIAL=1,1");
+        assert_eq!(redact_at("AT^NDISSTATQRY?"), "AT^NDISSTATQRY?");
+    }
+
+    #[test]
+    fn redact_strips_credentials_from_reply_line() {
+        let reply = "^SETAUTODIAL:1,1,\"IP\",\"cmnet\",\"user1\",\"s3cret\",0\r\nOK";
+        let out = redact_at_reply(&first_line(reply));
+        assert!(!out.contains("user1"), "{out}");
+        assert!(
+            !out.contains("s3cret"),
+            "★ 回显同样会进日志，必须打码: {out}"
+        );
+        assert!(out.contains("cmnet"), "{out}");
     }
 }

@@ -34,7 +34,7 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -43,8 +43,17 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::config::Config;
 use crate::switcher::{AtState, SwitchReport, Switcher};
 
-/// 读请求头的时间上限：防住"连上就不发数据"的连接占着资源。
+/// **单行**请求头的读取上限：防住"连上就不发数据"的连接占着资源。
+///
+/// ★ 它只约束一行。整体还必须有 [`HEAD_TOTAL_TIMEOUT`] 与 [`MAX_HEADER_LINES`]，
+/// 否则"每 9 秒发一行、永不发结束空行"能把连接永久占住（见 `handle`）。
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 读**整个请求头**的总时长上限（行数 × 单行上限之外的兜底）。
+const HEAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 请求头最多允许多少行（我们一个 header 都不需要，纯防御）。
+const MAX_HEADER_LINES: usize = 64;
 
 /// 请求行 / 单个 header 行的长度上限（与后端 RPC 的 8192 同量级）。
 pub(crate) const MAX_LINE: usize = 8192;
@@ -114,20 +123,50 @@ async fn handle(stream: TcpStream, sw: Arc<Switcher>) -> io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    let request_line = match read_line(&mut reader).await? {
+    // ★ 读请求头也必须有**总时长**预算。
+    //
+    // `read_line` 的单行超时挡不住"每 9 秒发一行、永不发结束空行"——那样一条连接
+    // 会被永久占住；占满 MAX_CONNECTIONS 之后所有新连接（含合法的 /switch）
+    // 都会拿到 503。没有鉴权的端口上这是一条现实的 DoS 路径。
+    let head_deadline = Instant::now() + HEAD_TOTAL_TIMEOUT;
+
+    // 统一的读头封装：总时长用尽 → 回 408 而不是把它当"连接异常"上报。
+    macro_rules! head_line {
+        () => {
+            match read_line(&mut reader, head_deadline).await {
+                Ok(v) => v,
+                Err(e) if e.get_ref().is_some_and(|r| r.is::<HeadDeadlineExceeded>()) => {
+                    return respond_plain(&mut write_half, 408, "请求头读取超时").await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+    }
+
+    let request_line = match head_line!() {
         Some(l) if !l.trim().is_empty() => l,
         // 空连接（探活/端口扫描）：直接关掉，不作为错误
         _ => return Ok(()),
     };
 
-    // 读完并丢弃请求头：我们不需要任何 header，但必须读完，
-    // 否则残留字节会污染下一次（keep-alive）解析。
-    loop {
-        match read_line(&mut reader).await? {
-            Some(l) if l.trim().is_empty() => break,
+    // 读完并丢弃请求头：我们不需要任何 header，但必须读完（避免把请求体的字节
+    // 当成下一行）。本服务每个响应都 Connection: close，没有 keep-alive 复用。
+    let mut head_done = false;
+    for _ in 0..MAX_HEADER_LINES {
+        match head_line!() {
+            Some(l) if l.trim().is_empty() => {
+                head_done = true;
+                break;
+            }
             Some(_) => continue,
-            None => break,
+            // ★ 对端在读头期间就关了：这是**不完整的请求**，不能当成"头读完了"
+            //   去执行换 IP —— 一个 TCP 半途断开的连接不该有副作用。
+            None => return Ok(()),
         }
+    }
+    if !head_done {
+        // 行数超限：明确拒绝，别让它继续占着连接额度。
+        return respond_plain(&mut write_half, 431, "请求头行数过多").await;
     }
 
     let Some((method, path)) = parse_request_line(&request_line) else {
@@ -261,6 +300,7 @@ where
 {
     let probe = sw.probe().await;
     let last = sw.last_report().await;
+    let attempt = sw.last_attempt().await;
     let cfg = sw.config();
 
     let body = serde_json::json!({
@@ -273,6 +313,14 @@ where
         "marker": cfg.marker,
         "apn_pool_size": cfg.apn_list.len(),
         "timeout_secs": cfg.timeout.as_secs(),
+        // ★ 最近一次**尝试**（成功失败都记）。失败时 last_switch 会停留在上一次成功，
+        //   只看它会把"一直失败"误读成"一直成功" —— 这两个字段要一起看。
+        "last_attempt": attempt.as_ref().map(|a| serde_json::json!({
+            "at_unix": a.at_unix,
+            "ok": a.ok,
+            "err": a.err,
+            "note": a.note,
+        })),
         "last_switch": last.as_ref().map(|r| serde_json::json!({
             "method": r.method.as_str(),
             "apn": r.apn,
@@ -348,6 +396,8 @@ fn reason(code: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Unknown",
     }
@@ -366,20 +416,56 @@ fn reason(code: u16) -> &'static str {
 /// 判红用例见 `e2e_tests::read_line_is_bounded_by_max_line`：它直接把一个
 /// **永不结束**的输入喂进来，量"到底读掉了多少字节"——这是唯一能直接观测
 /// 上限的位置（在 socket 上量会被内核缓冲掩盖）。
-pub(crate) async fn read_line<R>(reader: &mut R) -> io::Result<Option<String>>
+pub(crate) async fn read_line<R>(reader: &mut R, deadline: Instant) -> io::Result<Option<String>>
 where
     R: AsyncBufReadExt + Unpin,
 {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(deadline_exceeded());
+    }
+    // 本行只允许用 HEADER_TIMEOUT，但同时不超过总预算。
+    let cap = left.min(HEADER_TIMEOUT);
     let mut buf = Vec::new();
     let mut limited = reader.take(MAX_LINE as u64); // 读取期硬上限
-    let read = tokio::time::timeout(HEADER_TIMEOUT, limited.read_until(b'\n', &mut buf)).await;
+    let read = tokio::time::timeout(cap, limited.read_until(b'\n', &mut buf)).await;
     match read {
-        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "读请求超时")),
+        Err(_) => {
+            if Instant::now() >= deadline {
+                Err(deadline_exceeded())
+            } else {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "读请求超时"))
+            }
+        }
         Ok(Err(e)) => Err(e),
         // 0 字节：对端关闭，或已经读到 MAX_LINE 上限（行超长/不发换行）
         Ok(Ok(0)) => Ok(None),
         Ok(Ok(_)) => Ok(Some(String::from_utf8_lossy(&buf).into_owned())),
     }
+}
+
+/// 读请求头超过**总时长**预算。
+///
+/// 用一个自定义错误类型而不是 `io::ErrorKind::TimedOut`：调用方要能把它与
+/// "真的读出错"区分开 —— 前者回 408 就收工（客户端自己磨蹭导致的），
+/// 后者才算连接异常、值得打日志。
+#[derive(Debug)]
+pub(crate) struct HeadDeadlineExceeded;
+
+impl std::fmt::Display for HeadDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "读请求头超时（总时长 {}s 用尽）",
+            HEAD_TOTAL_TIMEOUT.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for HeadDeadlineExceeded {}
+
+fn deadline_exceeded() -> io::Error {
+    io::Error::new(io::ErrorKind::Other, HeadDeadlineExceeded)
 }
 
 /// 从请求行解析出方法与路径（丢弃 query）。
